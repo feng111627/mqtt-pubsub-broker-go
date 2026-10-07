@@ -4,6 +4,7 @@ package session
 
 import (
 	"sync"
+	"time"
 
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/packet"
 )
@@ -14,6 +15,10 @@ type Inflight struct {
 	Packet   *packet.Packet
 	// Stage: 0=等待PUBACK(QoS1) 1=等待PUBREC(QoS2) 2=等待PUBCOMP(QoS2)
 	Stage int
+	// SharedGroup 非空表示该在途消息属于某共享订阅组。连接掉线时它会被
+	// 组回收（转移给其他在线成员），而不是留在本会话重连重发，从而既不丢
+	// 也不会被原成员重连后重复消费。
+	SharedGroup string
 }
 
 // Session 一个客户端会话。所有方法并发安全。
@@ -22,18 +27,36 @@ type Session struct {
 	CleanStart bool
 
 	mu          sync.Mutex
+	cfg         Config
+	now         func() time.Time
 	subs        map[string]byte      // filter -> qos
 	inflightOut map[uint16]*Inflight // broker -> client 方向
-	inflightIn  map[uint16]struct{}  // client -> broker 方向（QoS2 去重）
-	pending     []*packet.Packet     // 离线期间缓存的 QoS>0 消息
+	inflightIn  map[uint16]struct{}  // client -> router 方向（QoS2 去重）
+	queued      []*QueuedMsg         // 离线期间缓存的消息（FIFO，含入队时间）
 	nextID      uint16
+
+	// 在线状态与过期
+	online         bool
+	lastDisconnect time.Time
+	expired        bool
+
+	// 丢弃计数，便于容量与过期策略的行为可观测、可解释
+	droppedCount        int64 // 队列满被拒
+	expiredDroppedCount int64 // TTL 过期或会话过期被清
 }
 
-// New 创建会话。
+// New 创建会话（默认配置）。
 func New(clientID string, cleanStart bool) *Session {
+	return NewWithConfig(clientID, cleanStart, DefaultConfig())
+}
+
+// NewWithConfig 使用指定容量/过期配置创建会话。
+func NewWithConfig(clientID string, cleanStart bool, cfg Config) *Session {
 	return &Session{
 		ClientID:    clientID,
 		CleanStart:  cleanStart,
+		cfg:         cfg.resolved(),
+		now:         time.Now,
 		subs:        make(map[string]byte),
 		inflightOut: make(map[uint16]*Inflight),
 		inflightIn:  make(map[uint16]struct{}),
@@ -44,28 +67,57 @@ func New(clientID string, cleanStart bool) *Session {
 // Store 会话仓库，按 ClientID 索引。
 type Store struct {
 	mu       sync.Mutex
+	cfg      Config
+	nowFunc  func() time.Time // 新建会话继承的时间源（默认 time.Now）
 	sessions map[string]*Session
 }
 
-// NewStore 创建会话仓库。
+// NewStore 创建会话仓库（默认容量/过期配置）。
 func NewStore() *Store {
-	return &Store{sessions: make(map[string]*Session)}
+	return NewStoreWithConfig(DefaultConfig())
+}
+
+// NewStoreWithConfig 使用指定配置创建会话仓库。
+func NewStoreWithConfig(cfg Config) *Store {
+	return &Store{cfg: cfg.resolved(), nowFunc: time.Now, sessions: make(map[string]*Session)}
+}
+
+// SetClock 设置仓库时间源；已存在与后续新建的会话都继承（测试用）。
+func (s *Store) SetClock(f func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f != nil {
+		s.nowFunc = f
+	}
+	for _, sess := range s.sessions {
+		sess.SetClock(f)
+	}
+}
+
+// newSession 按仓库配置与时钟创建会话。
+func (s *Store) newSession(clientID string, cleanStart bool) *Session {
+	sess := NewWithConfig(clientID, cleanStart, s.cfg)
+	if s.nowFunc != nil {
+		sess.SetClock(s.nowFunc)
+	}
+	return sess
 }
 
 // Get 按 cleanStart 语义获取或创建会话：
 // cleanStart=true 时丢弃旧会话重建；否则复用已有会话（resumed=true）。
+// 已过期的持久会话不再复用，按新会话处理（resumed=false）。
 func (s *Store) Get(clientID string, cleanStart bool) (sess *Session, resumed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cleanStart {
-		sess = New(clientID, true)
+		sess = s.newSession(clientID, true)
 		s.sessions[clientID] = sess
 		return sess, false
 	}
-	if old, ok := s.sessions[clientID]; ok {
+	if old, ok := s.sessions[clientID]; ok && !old.Expired() {
 		return old, true
 	}
-	sess = New(clientID, false)
+	sess = s.newSession(clientID, false)
 	s.sessions[clientID] = sess
 	return sess, false
 }
@@ -206,19 +258,19 @@ func (s *Session) CompleteIn(packetID uint16) bool {
 	return true
 }
 
-// Enqueue 离线缓存一条消息。
-func (s *Session) Enqueue(p *packet.Packet) {
+// ReclaimSharedInflight 取出（并移除）本会话全部属于共享组的在途消息。
+// 连接掉线时由代理调用：这些消息将交还给组重新分发给在线成员，
+// 既不丢失也不会在原成员重连后被重复投递。
+func (s *Session) ReclaimSharedInflight() []*Inflight {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pending = append(s.pending, p)
-}
-
-// Drain 取出并清空离线缓存。
-func (s *Session) Drain() []*packet.Packet {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := s.pending
-	s.pending = nil
+	var out []*Inflight
+	for id, in := range s.inflightOut {
+		if in.SharedGroup != "" {
+			out = append(out, in)
+			delete(s.inflightOut, id)
+		}
+	}
 	return out
 }
 

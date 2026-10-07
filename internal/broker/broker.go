@@ -4,9 +4,17 @@ package broker
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/feng111627/mqtt-pubsub-broker-go/internal/delivery"
+	"github.com/feng111627/mqtt-pubsub-broker-go/internal/group"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/packet"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/session"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/topic"
@@ -14,7 +22,13 @@ import (
 
 // Broker 消息代理。
 type Broker struct {
+	cfg      Config
 	sessions *session.Store
+	groups   *group.Registry
+
+	// queuedTotal 统计当前全部会话离线队列 + 共享组兜底队列占用条数，
+	// 作为全局内存兜底；只增删计数，绝不因此淘汰其他目标的消息。
+	queuedTotal atomic.Int64
 
 	mu       sync.RWMutex
 	retained map[string]*packet.Packet // topic -> retained publish
@@ -23,17 +37,46 @@ type Broker struct {
 	ln     net.Listener
 	closed chan struct{}
 	once   sync.Once
+
+	nowFunc func() time.Time // 时间源（测试可替换以驱动 TTL/过期）
 }
 
-// New 创建代理。
+func (b *Broker) now() time.Time { return b.nowFunc() }
+
+// New 创建代理（默认容量与过期配置）。
 func New() *Broker {
-	return &Broker{
-		sessions: session.NewStore(),
+	return NewWithConfig(DefaultConfig())
+}
+
+// NewWithConfig 使用指定配置创建代理。
+func NewWithConfig(cfg Config) *Broker {
+	if cfg.SweepInterval <= 0 {
+		cfg.SweepInterval = defaultSweepInterval
+	}
+	b := &Broker{
+		cfg:      cfg,
+		sessions: session.NewStoreWithConfig(cfg.Session),
 		retained: make(map[string]*packet.Packet),
 		online:   make(map[string]*clientConn),
 		closed:   make(chan struct{}),
 	}
+	// 共享组消息 TTL 过期时回收全局堆积配额。
+	b.groups = group.NewRegistryWithHook(cfg.Group, func(n int64) { b.queuedTotal.Add(-n) })
+	b.nowFunc = time.Now
+	return b
 }
+
+// newWithClock 使用可控时钟创建代理（测试用）：代理、会话仓库与组队列
+// 都以该时钟作为 TTL/过期判定的时间来源。
+func newWithClock(cfg Config, f func() time.Time) *Broker {
+	b := NewWithConfig(cfg)
+	b.nowFunc = f
+	b.sessions.SetClock(f)
+	return b
+}
+
+// Config 返回代理配置（只读用途）。
+func (b *Broker) Config() Config { return b.cfg }
 
 // ListenAndServe 在指定地址监听并服务，直到 Close。
 func (b *Broker) ListenAndServe(addr string) error {
@@ -44,6 +87,8 @@ func (b *Broker) ListenAndServe(addr string) error {
 	b.mu.Lock()
 	b.ln = ln
 	b.mu.Unlock()
+
+	go b.sweepLoop()
 
 	for {
 		conn, err := ln.Accept()
@@ -106,76 +151,32 @@ func (b *Broker) register(clientID string, c *clientConn) {
 	}
 }
 
-// unregister 仅当当前在线连接仍是 c 时才摘除，避免误删新连接。
-func (b *Broker) unregister(clientID string, c *clientConn) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.online[clientID] == c {
-		delete(b.online, clientID)
+// route 将一条 PUBLISH 路由给所有命中的订阅者（普通 + 共享），
+// 并记录每个目标可区分的投递结果。
+func (b *Broker) route(p *packet.Packet) *delivery.Result {
+	res := b.routeWithResult(p)
+	logRouteResult(p, res)
+	return res
+}
+
+// Route 导出的路由入口，供库方式嵌入的调用方直接发布并拿到可区分结果
+// （不走网络接入时使用）。
+func (b *Broker) Route(p *packet.Packet) *delivery.Result {
+	return b.route(p)
+}
+
+// logRouteResult 用一行汇总日志说明本条消息各目标的投递状态。
+func logRouteResult(p *packet.Packet, res *delivery.Result) {
+	summary := res.Summary()
+	parts := make([]string, 0, len(summary))
+	for status, n := range summary {
+		parts = append(parts, fmt.Sprintf("%s=%d", status, n))
 	}
-}
-
-// route 将一条 PUBLISH 路由给所有命中的订阅者。
-// 在线则直接下发（QoS>0 时登记在途），离线且为持久会话则入队。
-func (b *Broker) route(p *packet.Packet) {
-	matched := b.matchSubscribers(p.Topic)
-	for _, m := range matched {
-		qos := p.QoS
-		if m.qos < qos {
-			qos = m.qos // 投递 QoS = min(发布QoS, 订阅QoS)
-		}
-		out := &packet.Packet{
-			Header:  packet.FixedHeader{Type: packet.TypePUBLISH},
-			Topic:   p.Topic,
-			Payload: p.Payload,
-			QoS:     qos,
-			Retain:  p.Retain,
-		}
-		b.deliver(m.clientID, out)
-	}
-}
-
-type subscriber struct {
-	clientID string
-	qos      byte
-}
-
-// matchSubscribers 遍历全部会话的订阅，返回命中者。
-// 判定逻辑集中在 topic.Match，结果确定且可解释。
-func (b *Broker) matchSubscribers(topicName string) []subscriber {
-	var out []subscriber
-	b.sessions.Range(func(sess *session.Session) bool {
-		// 同一客户端多条过滤器命中时取最高 QoS，只投递一次
-		var best byte
-		matched := false
-		for filter, q := range sess.Subs() {
-			if topic.Match(filter, topicName) {
-				if !matched || q > best {
-					best = q
-				}
-				matched = true
-			}
-		}
-		if matched {
-			out = append(out, subscriber{clientID: sess.ClientID, qos: best})
-		}
-		return true
-	})
-	return out
-}
-
-// deliver 投递给指定客户端：在线直发，离线持久会话入队。
-func (b *Broker) deliver(clientID string, p *packet.Packet) {
-	b.mu.RLock()
-	c := b.online[clientID]
-	b.mu.RUnlock()
-	if c != nil {
-		c.enqueuePublish(p)
-		return
-	}
-	// 离线：仅持久会话缓存 QoS>0 消息
-	if sess := b.sessions.Peek(clientID); sess != nil && !sess.CleanStart && p.QoS > 0 {
-		sess.Enqueue(p)
+	sort.Strings(parts)
+	if res.AnyDropped() {
+		log.Printf("broker: PUBLISH topic=%s qos=%d DROPPED: %s", p.Topic, p.QoS, strings.Join(parts, ","))
+	} else {
+		log.Printf("broker: PUBLISH topic=%s qos=%d result: %s", p.Topic, p.QoS, strings.Join(parts, ","))
 	}
 }
 

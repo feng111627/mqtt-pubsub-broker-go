@@ -5,9 +5,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/feng111627/mqtt-pubsub-broker-go/internal/group"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/packet"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/session"
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/topic"
@@ -55,6 +57,7 @@ func (c *clientConn) serve() {
 
 	sess, resumed := c.broker.sessions.Get(first.ClientID, first.CleanStart)
 	c.sess = sess
+	sess.MarkConnected(c.broker.now())
 	c.broker.register(first.ClientID, c)
 
 	// CONNACK
@@ -67,15 +70,23 @@ func (c *clientConn) serve() {
 		return
 	}
 
-	// 恢复会话：重发出方向在途（置 DUP），随后补发离线队列
+	// 恢复会话：重发出方向在途（置 DUP），随后按发布顺序补发离线队列。
+	// 共享组在途消息只在“同 ID 会话接管”（旧连接被踢、本连接复用同一会话）
+	// 时仍存在于此，照常用 DUP 重发；正常重连时它们已被旧连接的清理逻辑
+	// 回收给组，不会出现在这里，因此不会重复消费。
 	for _, in := range sess.InflightOut() {
 		rp := *in.Packet
 		rp.Dup = true
 		c.enqueue(&rp)
 	}
-	for _, p := range sess.Drain() {
-		c.enqueuePublish(p)
+	drained := sess.DrainAt(c.broker.now())
+	// 离开离线队列：可补发的与已过期的都从全局堆积计数中回收
+	c.broker.queuedTotal.Add(-int64(len(drained.Messages) + drained.Expired))
+	for _, p := range drained.Messages {
+		c.enqueuePublish(p, "")
 	}
+	// 持久会话恢复后，驱动它所属的各共享组补发“无在线成员期间”的兜底消息。
+	c.pumpSharedGroupsOnConnect()
 
 	// 保存遗嘱，异常断开时发布
 	var will *packet.Packet
@@ -194,14 +205,33 @@ func (c *clientConn) forward(p *packet.Packet) {
 	c.broker.route(p)
 }
 
-// handleSubscribe 校验并登记订阅，回 SUBACK，随后下发命中的保留消息。
+// grantedSub 记录一条被接受的订阅及其共享组信息。
+type grantedSub struct {
+	filter string
+	qos    byte
+	shared string // 非空表示共享订阅，值为组名
+}
+
+// handleSubscribe 校验并登记订阅，回 SUBACK，随后下发命中的保留消息
+// （共享订阅按 MQTT 规范不下发保留消息，改为驱动组兜底队列补发）。
 func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 	if len(p.Subscriptions) == 0 {
 		return &packet.ProtocolError{Reason: "SUBSCRIBE with no filters"}
 	}
 	granted := make([]packet.Subscription, 0, len(p.Subscriptions))
+	accepted := make([]grantedSub, 0, len(p.Subscriptions))
 	for _, sub := range p.Subscriptions {
-		if err := topic.ValidateFilter(sub.Topic); err != nil {
+		groupName := ""
+		validateTarget := sub.Topic
+		if gname, suffix, ok := parseSharedFilter(sub.Topic); ok {
+			groupName = gname
+			validateTarget = suffix
+		} else if strings.HasPrefix(sub.Topic, sharePrefix) {
+			// $share/ 前缀但组名或过滤器缺失：非法
+			granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: 0x80})
+			continue
+		}
+		if err := topic.ValidateFilter(validateTarget); err != nil {
 			// 可区分的拒绝：该过滤器失败，其余照常
 			granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: 0x80})
 			continue
@@ -212,7 +242,11 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 			continue
 		}
 		c.sess.AddSub(sub.Topic, qos)
+		if groupName != "" {
+			c.broker.groups.AddMember(groupName, c.sess.ClientID)
+		}
 		granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: qos})
+		accepted = append(accepted, grantedSub{filter: sub.Topic, qos: qos, shared: groupName})
 	}
 	ack := &packet.Packet{
 		Header:        packet.FixedHeader{Type: packet.TypeSUBACK},
@@ -222,12 +256,15 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 	if err := c.send(ack); err != nil {
 		return err
 	}
-	// 保留消息在订阅成功后下发
-	for _, sub := range granted {
-		if sub.QoS == 0x80 {
+	// 订阅成功后的后续动作
+	for _, g := range accepted {
+		if g.shared != "" {
+			// 共享订阅：新成员上线，驱动该组兜底队列（组内只选在线成员投递）
+			c.broker.pumpGroup(g.shared)
 			continue
 		}
-		for _, rp := range c.broker.retainedFor(sub.Topic) {
+		// 普通订阅：保留消息在订阅成功后下发
+		for _, rp := range c.broker.retainedFor(g.filter) {
 			out := &packet.Packet{
 				Header:  packet.FixedHeader{Type: packet.TypePUBLISH},
 				Topic:   rp.Topic,
@@ -235,10 +272,10 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 				Retain:  true,
 			}
 			out.QoS = rp.QoS
-			if sub.QoS < out.QoS {
-				out.QoS = sub.QoS
+			if g.qos < out.QoS {
+				out.QoS = g.qos
 			}
-			c.enqueuePublish(out)
+			c.enqueuePublish(out, "")
 		}
 	}
 	return nil
@@ -247,6 +284,9 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 func (c *clientConn) handleUnsubscribe(p *packet.Packet) error {
 	for _, sub := range p.Subscriptions {
 		c.sess.RemoveSub(sub.Topic)
+		if gname, _, ok := parseSharedFilter(sub.Topic); ok {
+			c.broker.groups.RemoveMember(gname, c.sess.ClientID)
+		}
 	}
 	return c.send(&packet.Packet{
 		Header:        packet.FixedHeader{Type: packet.TypeUNSUBACK},
@@ -256,26 +296,33 @@ func (c *clientConn) handleUnsubscribe(p *packet.Packet) error {
 }
 
 // enqueuePublish 为出方向 PUBLISH 分配 PacketID 并登记在途，再入发送队列。
-func (c *clientConn) enqueuePublish(p *packet.Packet) {
+// sharedGroup 非空时把该在途消息标记为属于共享组，供掉线回收。
+// 返回 false 表示连接已关闭、消息未进入发送队列（调用方需另行兜底）。
+func (c *clientConn) enqueuePublish(p *packet.Packet, sharedGroup string) bool {
 	if p.QoS > 0 {
 		id := c.sess.NextPacketID()
 		if id == 0 {
-			return // 在途耗尽，丢弃并记日志
+			log.Printf("broker: client %s inflight window exhausted, message dropped topic=%s", c.sess.ClientID, p.Topic)
+			return false // 在途耗尽，丢弃并记日志
 		}
 		p.PacketID = id
 		c.sess.TrackOut(&session.Inflight{
-			PacketID: id,
-			Packet:   p,
-			Stage:    map[byte]int{1: 0, 2: 1}[p.QoS],
+			PacketID:    id,
+			Packet:      p,
+			Stage:       map[byte]int{1: 0, 2: 1}[p.QoS],
+			SharedGroup: sharedGroup,
 		})
 	}
-	c.enqueue(p)
+	return c.enqueue(p)
 }
 
-func (c *clientConn) enqueue(p *packet.Packet) {
+// enqueue 入发送队列；连接关闭时返回 false，绝不阻塞在已关闭连接上。
+func (c *clientConn) enqueue(p *packet.Packet) bool {
 	select {
 	case c.sendCh <- p:
+		return true
 	case <-c.done:
+		return false
 	}
 }
 
@@ -314,13 +361,71 @@ func (c *clientConn) publishWill(will *packet.Packet) {
 	}
 }
 
-// cleanup 连接退出：摘除在线表，按 CleanStart 语义清理会话。
+// cleanup 连接退出：摘除在线表，按 CleanStart/会话接管语义清理。
 func (c *clientConn) cleanup() {
 	c.close()
-	if c.sess != nil {
-		c.broker.unregister(c.sess.ClientID, c)
-		if c.sess.CleanStart {
-			c.broker.sessions.Remove(c.sess.ClientID)
+	if c.sess == nil {
+		return
+	}
+	id := c.sess.ClientID
+	// 仅当摘除的确实是本连接时才做离线处理；同 ID 会话接管时新连接仍在线，
+	// 不能把它标记成离线，也不能回收它持有的共享在途消息。
+	c.broker.mu.Lock()
+	current := c.broker.online[id]
+	takenOver := current != nil && current != c
+	if current == c {
+		delete(c.broker.online, id)
+	}
+	c.broker.mu.Unlock()
+
+	if takenOver {
+		return
+	}
+
+	c.sess.SetOnline(false, c.broker.now())
+
+	// 共享组：把本连接未确认完的消息回收给组，并立即驱动组分发给在线成员。
+	// 这些消息已从本会话移除，原成员重连后不会再收到，避免重复消费。
+	reclaimed := c.sess.ReclaimSharedInflight()
+	if len(reclaimed) > 0 {
+		byGroup := map[string][]*group.Queued{}
+		now := c.broker.now()
+		for _, in := range reclaimed {
+			byGroup[in.SharedGroup] = append(byGroup[in.SharedGroup], &group.Queued{
+				Topic:      in.Packet.Topic,
+				Payload:    in.Packet.Payload,
+				QoS:        in.Packet.QoS,
+				Retain:     in.Packet.Retain,
+				EnqueuedAt: now,
+			})
+		}
+		for gname, qs := range byGroup {
+			if g := c.broker.groups.Get(gname); g != nil {
+				g.Splice(qs, now)
+				c.broker.pumpGroup(gname)
+			}
+		}
+	}
+
+	// CleanStart 会话：断开即销毁，并从所有共享组移除。
+	// 持久会话保留（离线堆积/过期由会话生命周期负责）。
+	if c.sess.CleanStart {
+		c.broker.groups.RemoveClient(id)
+		c.broker.sessions.Remove(id)
+	}
+}
+
+// pumpSharedGroupsOnConnect 持久会话重连后，对其订阅涉及的每个共享组
+// 触发一次兜底队列补发（有在线成员才会真正投递）。
+func (c *clientConn) pumpSharedGroupsOnConnect() {
+	seen := map[string]struct{}{}
+	for f := range c.sess.Subs() {
+		if gname, _, ok := parseSharedFilter(f); ok {
+			if _, dup := seen[gname]; dup {
+				continue
+			}
+			seen[gname] = struct{}{}
+			c.broker.pumpGroup(gname)
 		}
 	}
 }

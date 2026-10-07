@@ -4,12 +4,22 @@
 QoS 状态机均为自实现（未使用现成代理库）。设备侧与后台侧通过本机回环
 （127.0.0.1）即可完成发布订阅。
 
+本轮新增两类能力：
+
+- **共享订阅（订阅组）**：`$share/<组名>/<过滤器>`。同组多成员订阅时一条
+  消息在组内只投递给一个成员（轮询负载均衡），成员进出自动重平衡；成员
+  掉线时其手上未确认的消息转交给仍在线成员；组内暂时无在线成员时消息进入
+  该组兜底队列，成员回来后按序补发。
+- **持久会话离线堆积增强**：离线期间命中订阅的消息按发布顺序堆积，带
+  容量上限与消息/会话过期规则，重连后补发；不同会话之间严格隔离、互不挤占。
+
+
 ## 支持的协议版本
 
 | 版本 | 协议级别 | 状态 |
 |------|---------|------|
-| MQTT 3.1.1 | 4 | 完整支持 |
-| MQTT 5.0 | 5 | 接入与基础报文支持（属性区解析并跳过，不实现 v5 扩展特性） |
+| MQTT 3.1.1 | 4 | 完整支持，**含共享订阅 `$share/...`** |
+| MQTT 5.0 | 5 | 接入与基础报文支持（属性区解析并跳过）；共享订阅按 `$share` 约定同样可用 |
 | MQTT 3.1 (MQIsdp) | 3 | 明确拒绝（CONNACK 返回码 1） |
 
 同一代理端口可同时接入两个版本的客户端，版本按每条连接的 CONNECT
@@ -26,15 +36,55 @@ QoS 状态机均为自实现（未使用现成代理库）。设备侧与后台�
 - 同一客户端多条过滤器命中同一主题时，只投递一次，取最高订阅 QoS。
 - 非法过滤器（如 `a/#/b`）在 SUBACK 中以 0x80 单独拒绝，不影响同报文中的其他过滤器。
 
-## 会话语义
+### 共享订阅（订阅组）
+
+订阅过滤器写成 `$share/<组名>/<真实过滤器>` 即可，例如 `$share/orders/new/#`。
+这是 MQTT 5.0 规定的 `$share` 约定；**本代理在 3.1.1 与 5.0 接入上都接受**，
+不依赖 v5 属性。语义：
+
+- **组内单投**：同组多个在线成员命中同一主题时，一条消息只投递给其中一个成员，
+  不会变成组内全员各收一遍。
+- **自动负载均衡与重平衡**：成员按字典序轮询（round-robin）；成员陆续接入、
+  退出后候选集合自动变化，新消息立即在当前在线成员间重新平衡，无需重启。
+- **掉线消息转移**：某成员收到 QoS>0 消息但尚未确认（PUBACK/PUBCOMP）就掉线时，
+  这些在途消息会被**组回收**并转交给组内仍在线的成员；消息从原会话移除，
+  因此原成员重连不会重复消费。QoS0 遵循“至多一次”，连接断开即可能丢失。
+- **无在线成员兜底**：组里一个在线成员都没有时，新消息进入该组的**兜底队列**；
+  任意成员重新上线后按 FIFO 补发（回收的未确认消息排在新消息之前），
+  仍然只投递给一个成员。兜底可配置关闭，关闭后无成员时直接返回
+  `group-unavailable`（不静默吞掉）。
+- 同一客户端同时有普通订阅与同主题共享订阅时，两种语义彼此独立、各投递一次
+  （符合 MQTT 共享订阅规范）；共享订阅**不下发保留消息**（规范行为）。
+- 组在所有成员离开且兜底队列为空时自动回收，不残留空组。
+
+## 会话语义与离线堆积
 
 - 会话按 ClientID 索引（`internal/session`）。
-- `CleanStart=true`：丢弃旧会话（含订阅、在途消息、离线队列），
-  断开时会话删除。
-- `CleanStart=false`：持久会话。断开后订阅保留，QoS>0 的离线消息入队，
-  重连后补发；CONNACK 的 SessionPresent 置位表示会话被恢复。
+- `CleanStart=true`：丢弃旧会话（含订阅、在途消息、离线队列），断开时会话删除。
+- `CleanStart=false`：持久会话。断开后订阅保留；离线期间命中其订阅的消息
+  **按发布顺序（FIFO）堆积**，重连后先重发未确认在途（DUP=1），再补发离线队列。
+  CONNACK 的 SessionPresent 置位表示会话被恢复。
 - 同一 ClientID 新连接接入时，旧连接被踢除（会话接管），不会串号。
-- 并发连接状态完全隔离：每个连接独立的会话指针与发送队列。
+- 并发连接状态完全隔离：每个连接独立的会话指针、在途窗口与离线队列。
+
+### 容量与过期策略（默认值与可配置项）
+
+| 策略 | 默认值 | 含义 / 满了或过期怎么办 |
+|------|--------|------------------------|
+| 单会话离线队列上限 `MaxQueue` | **1000 条** | 满了**拒绝新消息**（结果 `queue-full`），不淘汰旧消息，更不挤占其他会话 |
+| 消息存活时间 `MessageTTL` | **1 小时** | 入队早于 `now-TTL` 的消息在补发、新消息入队、后台巡检时惰性清除，顺序不变 |
+| 会话过期 `SessionExpiry` | **0（永不过期）** | 持久会话离线超过该时长则过期：释放消息内存、不再入队，路由返回 `session-expired`；同 ID 重连按新会话处理 |
+| 单共享组兜底队列上限 `GroupQueueCap` | **1000 条** | 满了拒绝新消息（`queue-full`）；设为 **0 关闭兜底**，无在线成员时返回 `group-unavailable` |
+| 全局堆积上限 `TotalQueuedMessages` | **100000 条** | 全部会话离线队列 + 全部组兜底队列占用的总条数；达到上限只拒绝**新入队者**，绝不淘汰/挤占其他目标已有的消息 |
+| 后台巡检周期 `SweepInterval` | **1 分钟** | 周期清理过期消息、过期会话、空闲共享组 |
+
+容量隔离保证：每个会话有自己的上限，先达到上限的会话只拒绝它自己的新消息；
+全局上限是最后的内存兜底。**任何一个会话积压过多都不会把别的会话挤掉，
+也不会让不同会话的消息串到一起。** 过期与容量行为都通过丢弃计数与结果状态
+可观测，不是静默丢弃。
+
+上述参数可用 `broker.NewWithConfig(broker.Config{...})` 在代码中配置，
+也可通过 `mqttd` 命令行覆盖（见“本地验证”）。
 
 ## QoS 投递语义
 
@@ -55,12 +105,33 @@ QoS 状态机均为自实现（未使用现成代理库）。设备侧与后台�
 - 新订阅命中保留消息时立即下发（Retain 标志置位）。
 - 以零字节载荷发布的 RETAIN 消息清除对应主题的保留消息。
 
-## 错误分类
+## 投递结果可区分（internal/delivery）
 
-操作失败可区分三类错误（`internal/packet`）：
+每条 PUBLISH 路由后都会产生按目标划分的结果集合 `*delivery.Result`，
+每个命中目标（普通会话或共享组）一个 `Outcome`，状态互不混淆，绝不静默吞掉：
 
-- **协议错误** `ErrProtocol`：畸形报文、非法主题、保留位错误、
-  不支持的协议级别等，携带具体原因（`*ProtocolError`）。
+| 状态 | 含义 |
+|------|------|
+| `delivered-online` | 目标在线，消息已进入其发送队列 |
+| `queued-offline` | 订阅者离线，消息已按发布顺序进入其持久会话离线队列 |
+| `shared-delivered` | 共享组内已分发给某一个在线成员 |
+| `shared-queued` | 组内暂无在线成员，消息已进入该组兜底队列 |
+| `no-subscribers` | 没有任何普通/共享订阅命中该主题 |
+| `queue-full` | 会话离线队列或组兜底队列已满（或达全局上限），消息被拒，`Dropped=true` |
+| `session-expired` | 命中的持久会话已过期，不再接收消息 |
+| `group-unavailable` | 共享组当前无在线成员，且兜底队列被关闭 |
+
+获取方式：
+
+- 网络接入时，代理对每条 PUBLISH 输出一行汇总日志，例如
+  `PUBLISH topic=jobs qos=1 result: shared-delivered=1`；
+  出现丢弃时为 `... DROPPED: queue-full=1`。
+- 以库方式嵌入时调用 `broker.Route(p)` 直接拿到 `*delivery.Result`，
+  用 `HasStatus(...)`、`AnyDropped()`、`Summary()` 判定。
+
+此外协议层错误仍可区分三类（`internal/packet`）：
+
+- **协议错误** `ErrProtocol`：畸形报文、非法主题、保留位错误等，携带具体原因。
 - **状态错误** `ErrState`：与当前会话状态冲突（如未 CONNECT 先发其他报文、
   同一连接重复 CONNECT）。
 - **连接错误** `ErrConn`：底层网络读写失败。
@@ -73,36 +144,72 @@ QoS 状态机均为自实现（未使用现成代理库）。设备侧与后台�
 
 ```sh
 go build ./...
-go test ./... -v
+go test ./... -v            # 查看每个业务用例与结果日志
+go test -race ./...         # 并发场景竞态检测
 ```
 
-测试覆盖（输出中可直接看到各业务用例与结果）：
+测试覆盖（`-v` 输出中以 `业务[...] 用例/结果` 标注，可直接看到覆盖了哪些业务）：
 
-- `internal/topic`：通配符匹配（`+`/`#`/系统主题/空层级）、过滤器与主题名校验
-- `internal/packet`：CONNECT/PUBLISH 编解码往返、v5 属性区、
-  各类畸形报文（未知类型、QoS3、保留位、截断报文等）的可区分拒绝
-- `internal/session`：CleanStart 语义、QoS2 去重、在途状态机、离线队列
-- `internal/broker`（集成测试，真实 TCP 回环）：
-  通配符路由命中/不命中、QoS1 顺序投递、QoS2 恰好一次、
-  QoS1 断线重传（DUP=1）、QoS2 重复投递去重、
-  持久会话离线消息恢复、CleanStart 清理、保留消息下发与清除、
-  非法订阅过滤器拒绝、并发连接隔离、同 ClientID 会话接管、MQTT 5.0 接入
+- `internal/topic`：通配符匹配、过滤器与主题名校验（原有，无回归）
+- `internal/packet`：CONNECT/PUBLISH 编解码、v5 属性区、各类畸形报文（原有，无回归）
+- `internal/session`：CleanStart、QoS2 去重、在途状态机（原有）+ 本轮新增
+  - 离线堆积按发布顺序补发
+  - 队列容量上限：满了拒绝新消息、保留旧消息
+  - 消息 TTL：补发剔除过期、入队惰性清理
+  - 会话过期：到期不再入队、重连同 ID 得新会话
+  - 会话隔离：一个会话堆满不挤占其他会话、消息不串号
+- `internal/group`：轮询负载均衡与成员增删重平衡、跳过离线成员、
+  兜底队列容量/TTL、回收消息优先补发、空闲组回收
+- `internal/broker`（真实 TCP 回环 + 进程内直接路由）：
+  - 原有全部用例（通配符/QoS1 顺序/QoS2 恰好一次/重传 DUP/保留消息/
+    会话接管/v5 接入等）均保留并通过，无回归
+  - 共享订阅组内单投（不广播、无重复、负载均衡）
+  - 成员退出/加入自动重平衡
+  - 成员掉线未确认消息转交在线成员、原成员重连不重复
+  - 组内无在线成员时兜底排队、上线后按序补发
+  - 投递结果分类：no-subscribers / queued-offline / queue-full /
+    session-expired / group-unavailable / shared-delivered / shared-queued
+  - 容量隔离：一个会话队列打满不影响其他会话
+  - 并发：大量发布 + 订阅者反复进出组 + 巡检并发，`-race` 下无竞态、
+    不卡死、顺序不错乱、全局堆积有界
 
 ### 手工冒烟
 
 ```sh
-# 终端 1：启动代理
-go run ./cmd/mqttd -addr 127.0.0.1:1883
+# 终端 1：启动代理（可选地覆盖容量/过期策略）
+go run ./cmd/mqttd -addr 127.0.0.1:1883 \
+  -session-queue 1000 -message-ttl 1h -session-expiry 0 \
+  -group-queue 1000 -total-queue 100000 -sweep 1m
 
-# 终端 2：设备侧订阅（支持通配符）
+# 终端 2/3：两个消费者加入同一个共享组 workers，只会各拿到一部分消息
+go run ./cmd/mqttcli sub -id w1 -topic '$share/workers/jobs' -qos 1 -clean
+go run ./cmd/mqttcli sub -id w2 -topic '$share/workers/jobs' -qos 1 -clean
+
+# 终端 4：后台侧批量发布，观察 w1/w2 分摊（不是两边都收全量）
+go run ./cmd/mqttcli pub -id back -topic jobs -payload 'job-1' -qos 1
+
+# 验证无成员兜底：先只启动 w1 订阅后 Ctrl-C 断开，再发若干条，然后重新用
+# 同一持久会话（-clean=false）接入，应按发布顺序收到积压消息
+go run ./cmd/mqttcli sub -id w1 -topic '$share/workers/jobs' -qos 1
+# （断开后发布）
+go run ./cmd/mqttcli pub -id back -topic jobs -payload 'backlog-1' -qos 1
+# （重新接入，默认 clean=true；持久会话请显式 -clean=false）
+
+# 普通（独占）订阅与 MQTT 5.0 接入仍照常
 go run ./cmd/mqttcli sub -id dev-1 -topic 'sensors/+/temp' -qos 1
-
-# 终端 3：后台侧发布
-go run ./cmd/mqttcli pub -id back-1 -topic sensors/kitchen/temp -payload '21.5' -qos 1
-
-# 使用 MQTT 5.0 接入
 go run ./cmd/mqttcli sub -id dev-2 -topic '#' -v5
 ```
+
+`mqttd` 命令行参数与默认值：
+
+| 参数 | 默认值 | 对应配置 |
+|------|--------|----------|
+| `-session-queue` | 1000 | 单会话离线队列上限 |
+| `-message-ttl` | 1h | 离线/兜底消息 TTL，0 不过期 |
+| `-session-expiry` | 0 | 持久会话离线过期，0 不过期 |
+| `-group-queue` | 1000 | 单共享组兜底队列上限，0 关闭兜底 |
+| `-total-queue` | 100000 | 全局堆积上限，0 不限 |
+| `-sweep` | 1m | 后台巡检周期 |
 
 ## 目录结构
 
@@ -111,7 +218,9 @@ cmd/mqttd          代理服务入口
 cmd/mqttcli        发布/订阅命令行客户端
 internal/packet    MQTT 报文编解码（3.1.1 + 5.0），错误分类
 internal/topic     主题校验与通配符匹配（纯函数）
-internal/session   会话、订阅、QoS 在途状态机、离线队列
-internal/broker    代理核心：连接接入、路由、保留消息、会话生命周期
+internal/session   会话、订阅、QoS 在途状态机、离线堆积（容量/TTL/过期）
+internal/group     共享订阅组：轮询分发、重平衡、掉线回收、兜底队列
+internal/delivery  投递结果状态分类（可区分、不静默吞掉）
+internal/broker    代理核心：接入、普通+共享路由、保留消息、会话/组生命周期
 internal/client    客户端库（供 mqttcli 与测试使用）
 ```
