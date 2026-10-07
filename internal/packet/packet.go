@@ -44,6 +44,14 @@ const (
 	ConnRefusedNotAuthorized byte = 5
 )
 
+// MQTT 5.0 PUBACK/PUBREC/PUBCOMP 原因码（本代理会用到的子集）。
+const (
+	ReasonSuccess               byte = 0x00
+	ReasonNoMatchingSubscribers byte = 0x10
+	ReasonQuotaExceeded         byte = 0x97
+	ReasonSessionTakenOver      byte = 0x8E
+)
+
 // 错误分类：协议错误 / 状态错误 / 连接错误。
 var (
 	// ErrProtocol 表示畸形报文、非法字段等协议层错误。
@@ -246,6 +254,8 @@ func (p *Packet) Decode(body []byte, version byte) error {
 			return p.decodeUnsubscribeV5(r)
 		}
 		return p.decodeBody(body)
+	case TypePUBACK, TypePUBREC, TypePUBREL, TypePUBCOMP:
+		return p.decodeAck(r, version)
 	case TypeSUBACK:
 		id, err := r.uint16()
 		if err != nil {
@@ -367,6 +377,24 @@ func (r *reader) skipProperties() error {
 	return protoErr("malformed properties length")
 }
 
+// decodeAck 解码 PUBACK/PUBREC/PUBREL/PUBCOMP；v5 读取可选原因码。
+func (p *Packet) decodeAck(r *reader, version byte) error {
+	id, err := r.uint16()
+	if err != nil {
+		return err
+	}
+	p.PacketID = id
+	if version == Version5 && r.remaining() > 0 {
+		code, err := r.byte()
+		if err != nil {
+			return err
+		}
+		p.ReasonCode = code
+		// 其余为属性区，忽略
+	}
+	return nil
+}
+
 func (p *Packet) decodeBody(body []byte) error {
 	r := &reader{buf: body}
 	switch p.Header.Type {
@@ -384,7 +412,6 @@ func (p *Packet) decodeBody(body []byte) error {
 			return err
 		}
 		p.PacketID = id
-		// v5 允许附带原因码与属性，此处忽略剩余字节
 		return nil
 	case TypeCONNACK:
 		flags, err := r.byte()
@@ -753,7 +780,15 @@ func (p *Packet) encodeAck(version byte) []byte {
 	binary.BigEndian.PutUint16(n[:], p.PacketID)
 	body := n[:]
 	if version == Version5 {
-		body = append(body, 0x00, 0x00) // reason success + empty properties
+		// PUBREL/PUBCOMP 保留原因码+属性占位；PUBACK/PUBREC 仅在非成功时显式携带。
+		switch p.Header.Type {
+		case TypePUBREL, TypePUBCOMP:
+			body = append(body, 0x00, 0x00)
+		default:
+			if p.ReasonCode != ReasonSuccess {
+				body = append(body, p.ReasonCode, 0x00)
+			}
+		}
 	}
 	return body
 }

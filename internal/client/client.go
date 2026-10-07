@@ -10,6 +10,25 @@ import (
 	"github.com/feng111627/mqtt-pubsub-broker-go/internal/packet"
 )
 
+// DeliveryError 表示发布已到达代理，但代理在投递阶段返回了非成功原因码
+// （仅 MQTT 5.0 的 PUBACK/PUBREC/PUBCOMP 可携带；3.1.1 无此字段）。
+// 调用方可据 ReasonCode 区分"无订阅者/队列满/会话过期"等结果。
+type DeliveryError struct {
+	ReasonCode byte
+}
+
+func (e *DeliveryError) Error() string {
+	return fmt.Sprintf("mqtt: broker delivery failed, reason code 0x%02x", e.ReasonCode)
+}
+
+// ackError 把 v5 原因码映射为可区分错误；0x00 或 3.1.1（无原因码）为成功。
+func ackError(code byte) error {
+	if code == 0 || code == packet.ReasonSuccess {
+		return nil
+	}
+	return &DeliveryError{ReasonCode: code}
+}
+
 // Message 收到的一条订阅消息。
 type Message struct {
 	Topic   string
@@ -303,8 +322,13 @@ func (c *Client) handle(p *packet.Packet) {
 			c.writePacket(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBREC}, PacketID: p.PacketID})
 		}
 	case packet.TypePUBACK, packet.TypePUBCOMP:
-		c.resolve(p.PacketID, nil)
+		c.resolve(p.PacketID, ackError(p.ReasonCode))
 	case packet.TypePUBREC:
+		if err := ackError(p.ReasonCode); err != nil {
+			// v5：代理在 PUBREC 即拒绝（无订阅者/队列满/会话过期），停止 QoS2 握手。
+			c.resolve(p.PacketID, err)
+			return
+		}
 		c.writePacket(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBREL, Flags: 0x02}, PacketID: p.PacketID})
 	case packet.TypePUBREL:
 		c.writePacket(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBCOMP}, PacketID: p.PacketID})

@@ -36,7 +36,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  mqttcli sub -addr ADDR -id ID -topic FILTER [-qos N] [-v5] [-clean]
+  mqttcli sub -addr ADDR -id ID -topic FILTER [-group NAME] [-qos N] [-v5] [-clean]
   mqttcli pub -addr ADDR -id ID -topic TOPIC -payload STR [-qos N] [-retain] [-v5]
 `)
 }
@@ -53,10 +53,16 @@ func cmdSub(args []string) {
 	addr := fs.String("addr", "127.0.0.1:1883", "broker address")
 	id := fs.String("id", "mqttcli-sub", "client id")
 	topic := fs.String("topic", "#", "topic filter")
+	group := fs.String("group", "", "shared subscription group name ($share/<group>/<topic>)")
 	qos := fs.Uint("qos", 1, "subscribe qos")
-	clean := fs.Bool("clean", true, "clean start")
+	clean := fs.Bool("clean", false, "clean start")
 	v5 := fs.Bool("v5", false, "use MQTT 5.0")
 	fs.Parse(args)
+
+	filter := *topic
+	if *group != "" {
+		filter = "$share/" + *group + "/" + *topic
+	}
 
 	c, err := client.Connect(*addr, client.Options{
 		ClientID:   *id,
@@ -66,11 +72,11 @@ func cmdSub(args []string) {
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
-	granted, err := c.Subscribe(*topic, byte(*qos))
+	granted, err := c.Subscribe(filter, byte(*qos))
 	if err != nil {
 		log.Fatalf("subscribe: %v", err)
 	}
-	log.Printf("subscribed to %q (granted qos=%d), waiting for messages...", *topic, granted)
+	log.Printf("subscribed to %q (granted qos=%d), waiting for messages...", filter, granted)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

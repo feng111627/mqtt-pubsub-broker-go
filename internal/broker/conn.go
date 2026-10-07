@@ -67,14 +67,28 @@ func (c *clientConn) serve() {
 		return
 	}
 
-	// 恢复会话：重发出方向在途（置 DUP），随后补发离线队列
+	// 恢复会话：
+	// 1) 重发普通订阅的出方向在途（置 DUP）；共享组在途已在掉线时转交他人，
+	//    不再由本人重发，避免组内重复消费。
+	// 2) 重新激活本会话的共享订阅（可能领到组兜底堆积）。
+	// 3) 按发布顺序补发离线队列（过期消息已在 Drain 内清理）。
 	for _, in := range sess.InflightOut() {
+		if in.GroupKey != "" {
+			continue
+		}
 		rp := *in.Packet
 		rp.Dup = true
 		c.enqueue(&rp)
 	}
+	for f := range sess.Subs() {
+		if sf, ok := topic.ParseShared(f); ok {
+			k := groupKey(sf.Group, sf.Filter)
+			c.broker.groups.join(k, sess.ClientID)
+			c.broker.groups.activate(k, sess.ClientID, c)
+		}
+	}
 	for _, p := range sess.Drain() {
-		c.enqueuePublish(p)
+		c.enqueuePublish(p, "", 0)
 	}
 
 	// 保存遗嘱，异常断开时发布
@@ -133,7 +147,7 @@ func (c *clientConn) handle(p *packet.Packet) error {
 	case packet.TypePUBLISH:
 		return c.handlePublish(p)
 	case packet.TypePUBACK:
-		c.sess.AckOut(p.PacketID)
+		c.ackInflight(p.PacketID)
 		return nil
 	case packet.TypePUBREC:
 		if !c.sess.AdvanceOut(p.PacketID) {
@@ -145,7 +159,7 @@ func (c *clientConn) handle(p *packet.Packet) error {
 		c.sess.CompleteIn(p.PacketID)
 		return c.send(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBCOMP}, PacketID: p.PacketID})
 	case packet.TypePUBCOMP:
-		c.sess.AckOut(p.PacketID)
+		c.ackInflight(p.PacketID)
 		return nil
 	case packet.TypeSUBSCRIBE:
 		return c.handleSubscribe(p)
@@ -164,43 +178,92 @@ func (c *clientConn) handle(p *packet.Packet) error {
 }
 
 // handlePublish 处理入方向 PUBLISH，按 QoS 等级走对应握手。
+// QoS1/2 的确认报文在 v5 下携带投递结果原因码（3.1.1 无原因码字段）。
 func (c *clientConn) handlePublish(p *packet.Packet) error {
 	if err := topic.ValidatePublish(p.Topic); err != nil {
 		return &packet.ProtocolError{Reason: "invalid publish topic: " + err.Error()}
 	}
 	switch p.QoS {
 	case 0:
-		c.forward(p)
+		c.forwardReport(p)
+		return nil
 	case 1:
-		c.forward(p)
-		return c.send(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBACK}, PacketID: p.PacketID})
+		report := c.forwardReport(p)
+		return c.send(&packet.Packet{
+			Header:     packet.FixedHeader{Type: packet.TypePUBACK},
+			PacketID:   p.PacketID,
+			ReasonCode: c.deliveryReason(report),
+		})
 	case 2:
-		// 去重：同一 PacketID 重复投递只路由一次，但仍回 PUBREC
+		// 去重：同一 PacketID 重复投递只路由一次，但仍回 PUBREC。
+		report := (*Report)(nil)
 		if dup := c.sess.TrackIn(p.PacketID); !dup {
-			c.forward(p)
+			report = c.forwardReport(p)
 		}
-		return c.send(&packet.Packet{Header: packet.FixedHeader{Type: packet.TypePUBREC}, PacketID: p.PacketID})
+		code := packet.ReasonSuccess
+		if report != nil {
+			code = c.deliveryReason(report)
+		}
+		return c.send(&packet.Packet{
+			Header:     packet.FixedHeader{Type: packet.TypePUBREC},
+			PacketID:   p.PacketID,
+			ReasonCode: code,
+		})
 	default:
 		return &packet.ProtocolError{Reason: "invalid QoS"}
 	}
-	return nil
 }
 
-// forward 路由并处理保留消息。
-func (c *clientConn) forward(p *packet.Packet) {
+// deliveryReason 按连接版本选择确认原因码（仅 v5 承载）。
+func (c *clientConn) deliveryReason(r *Report) byte {
+	if c.version >= packet.Version5 {
+		return r.v5Reason()
+	}
+	return 0
+}
+
+// forwardReport 处理保留消息并路由，返回投递明细。
+func (c *clientConn) forwardReport(p *packet.Packet) *Report {
 	if p.Retain {
 		c.broker.setRetained(p)
 	}
-	c.broker.route(p)
+	return c.broker.route(p)
+}
+
+// ackInflight 完成一条出方向握手；若是共享组投递，同时摘除组内在途记录。
+func (c *clientConn) ackInflight(packetID uint16) {
+	in, ok := c.sess.AckOut(packetID)
+	if ok && in != nil && in.GroupKey != "" {
+		c.broker.groups.ackToken(in.GroupKey, in.Token)
+	}
 }
 
 // handleSubscribe 校验并登记订阅，回 SUBACK，随后下发命中的保留消息。
+// 共享订阅（$share/group/filter）登记到组管理器，不触发保留消息。
 func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 	if len(p.Subscriptions) == 0 {
 		return &packet.ProtocolError{Reason: "SUBSCRIBE with no filters"}
 	}
 	granted := make([]packet.Subscription, 0, len(p.Subscriptions))
+	type retainedSub struct {
+		filter string
+		qos    byte
+	}
+	var retained []retainedSub
 	for _, sub := range p.Subscriptions {
+		if sf, shared := topic.ParseShared(sub.Topic); shared {
+			if err := topic.ValidateShared(sf); err != nil || sub.QoS > 2 {
+				granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: 0x80})
+				continue
+			}
+			qos := sub.QoS
+			c.sess.AddSub(sub.Topic, qos)
+			k := groupKey(sf.Group, sf.Filter)
+			c.broker.groups.join(k, c.sess.ClientID)
+			c.broker.groups.activate(k, c.sess.ClientID, c)
+			granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: qos})
+			continue
+		}
 		if err := topic.ValidateFilter(sub.Topic); err != nil {
 			// 可区分的拒绝：该过滤器失败，其余照常
 			granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: 0x80})
@@ -213,6 +276,7 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 		}
 		c.sess.AddSub(sub.Topic, qos)
 		granted = append(granted, packet.Subscription{Topic: sub.Topic, QoS: qos})
+		retained = append(retained, retainedSub{filter: sub.Topic, qos: qos})
 	}
 	ack := &packet.Packet{
 		Header:        packet.FixedHeader{Type: packet.TypeSUBACK},
@@ -222,12 +286,9 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 	if err := c.send(ack); err != nil {
 		return err
 	}
-	// 保留消息在订阅成功后下发
-	for _, sub := range granted {
-		if sub.QoS == 0x80 {
-			continue
-		}
-		for _, rp := range c.broker.retainedFor(sub.Topic) {
+	// 保留消息仅对普通订阅下发（共享订阅按协议不接收保留消息）
+	for _, sub := range retained {
+		for _, rp := range c.broker.retainedFor(sub.filter) {
 			out := &packet.Packet{
 				Header:  packet.FixedHeader{Type: packet.TypePUBLISH},
 				Topic:   rp.Topic,
@@ -235,10 +296,10 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 				Retain:  true,
 			}
 			out.QoS = rp.QoS
-			if sub.QoS < out.QoS {
-				out.QoS = sub.QoS
+			if sub.qos < out.QoS {
+				out.QoS = sub.qos
 			}
-			c.enqueuePublish(out)
+			c.enqueuePublish(out, "", 0)
 		}
 	}
 	return nil
@@ -247,6 +308,9 @@ func (c *clientConn) handleSubscribe(p *packet.Packet) error {
 func (c *clientConn) handleUnsubscribe(p *packet.Packet) error {
 	for _, sub := range p.Subscriptions {
 		c.sess.RemoveSub(sub.Topic)
+		if sf, ok := topic.ParseShared(sub.Topic); ok {
+			c.broker.groups.leave(groupKey(sf.Group, sf.Filter), c.sess.ClientID)
+		}
 	}
 	return c.send(&packet.Packet{
 		Header:        packet.FixedHeader{Type: packet.TypeUNSUBACK},
@@ -256,20 +320,36 @@ func (c *clientConn) handleUnsubscribe(p *packet.Packet) error {
 }
 
 // enqueuePublish 为出方向 PUBLISH 分配 PacketID 并登记在途，再入发送队列。
-func (c *clientConn) enqueuePublish(p *packet.Packet) {
+// groupKey/token 非空时表示这是一次共享组投递，在途记录携带组信息供掉线接管。
+func (c *clientConn) enqueuePublish(p *packet.Packet, groupKey string, token uint64) {
 	if p.QoS > 0 {
 		id := c.sess.NextPacketID()
 		if id == 0 {
-			return // 在途耗尽，丢弃并记日志
+			log.Printf("broker: client %s packet ids exhausted; dropping message", c.sess.ClientID)
+			return
 		}
 		p.PacketID = id
 		c.sess.TrackOut(&session.Inflight{
 			PacketID: id,
 			Packet:   p,
 			Stage:    map[byte]int{1: 0, 2: 1}[p.QoS],
+			GroupKey: groupKey,
+			Token:    token,
 		})
 	}
 	c.enqueue(p)
+}
+
+// tryEnqueue 非阻塞入发送队列；队列满或连接关闭时返回 false（共享组选择成员用）。
+func (c *clientConn) tryEnqueue(p *packet.Packet) bool {
+	select {
+	case c.sendCh <- p:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
 }
 
 func (c *clientConn) enqueue(p *packet.Packet) {
@@ -314,13 +394,41 @@ func (c *clientConn) publishWill(will *packet.Packet) {
 	}
 }
 
-// cleanup 连接退出：摘除在线表，按 CleanStart 语义清理会话。
+// cleanup 连接退出：摘除在线表，处理共享组在途接管，按 CleanStart 语义清理会话。
 func (c *clientConn) cleanup() {
 	c.close()
-	if c.sess != nil {
-		c.broker.unregister(c.sess.ClientID, c)
-		if c.sess.CleanStart {
-			c.broker.sessions.Remove(c.sess.ClientID)
+	if c.sess == nil {
+		return
+	}
+	id := c.sess.ClientID
+	c.broker.unregister(id, c)
+
+	if c.sess.CleanStart {
+		// 临时会话：彻底摘除组成员身份，其未确认组消息转交他人或回兜底队列。
+		c.broker.groups.removeClient(id)
+		c.broker.sessions.Remove(id)
+		return
+	}
+
+	// 持久会话：仅当该 ClientID 已无任何在线连接（非会话接管）时，
+	// 才把未确认的共享组消息转交其他在线成员；同 ID 新连接接管时保留，
+	// 由新连接继续持有，避免组内重复消费。
+	if !c.broker.isOnline(id) {
+		for f := range c.sess.Subs() {
+			sf, ok := topic.ParseShared(f)
+			if !ok {
+				continue
+			}
+			k := groupKey(sf.Group, sf.Filter)
+			c.broker.groups.deactivate(k, id, c)
+		}
+		// 幂等摘出（按组令牌）：防止读写协程退出与主动关闭竞态导致的重复接管。
+		for _, in := range c.sess.GroupInflightTokens() {
+			got := c.sess.ReclaimGroupInflightToken(in.GroupKey, in.Token)
+			if got == nil {
+				continue // 已被另一条清理路径摘出
+			}
+			c.broker.groups.reclaim(got.GroupKey, id, got.Token, got.Packet)
 		}
 	}
 }
